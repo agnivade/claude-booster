@@ -1,142 +1,144 @@
 package main
 
 import (
-	"encoding/hex"
+	"bytes"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
-	"strconv"
-	"sync"
-	"time"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"path/filepath"
 )
 
+// todo:
+// parse the request into struct
+// disable haiku generation.
+// cache count_tokens response.
+// strip unnecessary words from prompts like - IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context or otherwise consider it in your response unless it is highly relevant to your task. Most of the time, it is not relevant.\n</system-reminder>\n
+// strip unnecessary tools from prompts.
+// re-arrange prompts to have tools earlier for better caching.
+// add Prometheus metrics
+
 func main() {
-	port := flag.Int("port", 8080, "Port number to listen on")
+	targetURL := flag.String("target", "", "Target URL to proxy to (required)")
+	listenAddr := flag.String("addr", "localhost", "Listen address")
+	listenPort := flag.String("port", "8080", "Listen port")
 	flag.Parse()
 
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("Received request %s %s %s\n", r.Method, r.Host, r.RemoteAddr)
-			if r.Method == http.MethodConnect {
-				handleTunneling(w, r)
-			} else {
-				handleHTTP(w, r)
-			}
-		}),
+	if *targetURL == "" {
+		log.Fatal("Target URL is required. Use -target flag.")
 	}
-	// create a listener
-	listener, err := net.Listen("tcp", ":"+strconv.Itoa(*port))
+
+	target, err := url.Parse(*targetURL)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Invalid target URL: %v", err)
 	}
-	log.Printf("Starting server on port %d", *port)
-	log.Fatal(server.Serve(listener))
-}
 
-func handleTunneling(w http.ResponseWriter, r *http.Request) {
-	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	proxy := &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+		},
+	}
+
+	// Add logging middleware
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logRequest(r)
+
+		// Capture response
+		responseWriter := &responseLogger{ResponseWriter: w}
+
+		proxy.ServeHTTP(responseWriter, r)
+
+		logResponse(responseWriter)
+	})
+
+	listenAddress := *listenAddr + ":" + *listenPort
+	log.Printf("Starting reverse proxy on %s, forwarding to %s", listenAddress, *targetURL)
+
+	err = http.ListenAndServe(listenAddress, handler)
 	if err != nil {
-		log.Printf("Failed to connect to host %s: %v", r.Host, err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		log.Fatalf("Failed to start server: %v", err)
 	}
-	w.WriteHeader(http.StatusOK)
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
+}
+
+type responseLogger struct {
+	http.ResponseWriter
+	statusCode int
+	body       bytes.Buffer
+}
+
+func (r *responseLogger) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
+	r.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (r *responseLogger) Write(body []byte) (int, error) {
+	r.body.Write(body)
+	return r.ResponseWriter.Write(body)
+}
+
+
+func logRequest(r *http.Request) {
+	printBlue("=== REQUEST ===\n")
+	printBlue("%s %s %s\n", r.Method, r.RequestURI, r.Proto)
+	printBlue("Host: %s\n", r.Host)
+
+	// Log headers
+	for name, values := range r.Header {
+		for _, value := range values {
+			printBlue("%s: %s\n", name, value)
+		}
 	}
-	clientConn, _, err := hijacker.Hijack()
+
+	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		printRed("Error reading request body: %v\n", err)
 		return
 	}
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	// printBlue("\nBody:\n%s\n", string(bodyBytes))
 
-	destTCP, ok := destConn.(*net.TCPConn)
-	if !ok {
-		http.Error(w, "Destination connection is not TCP", http.StatusInternalServerError)
-		return
-	}
-
-	clientTCP, ok := clientConn.(*net.TCPConn)
-	if !ok {
-		http.Error(w, "Client connection is not TCP", http.StatusInternalServerError)
-		return
-	}
-
-	go proxy(clientTCP, destTCP)
-}
-
-func handleHTTP(w http.ResponseWriter, req *http.Request) {
-	req.URL.Host = req.Host
-
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	// Write request body to file
+	filename, err := generateRandomFilename("request")
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		printRed("Error generating filename: %v\n", err)
 		return
 	}
-	defer resp.Body.Close()
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
+	err = os.WriteFile(filename, bodyBytes, 0644)
+	if err != nil {
+		printRed("Error writing request to file: %v\n", err)
+		return
+	}
+	printYellow("Request body saved to: %s\n", filename)
+}
+
+func logResponse(w *responseLogger) {
+	printGreen("=== RESPONSE ===\n")
+	printGreen("Status: %d %s\n", w.statusCode, http.StatusText(w.statusCode))
+
+	// Log response headers
+	for name, values := range w.Header() {
+		for _, value := range values {
+			printGreen("%s: %s\n", name, value)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-}
 
-func proxy(src, dst *net.TCPConn) {
-	defer src.Close()
-	defer dst.Close()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(src, io.TeeReader(dst, newHexDumper("[SERVER→CLIENT] ")))
-		if err != nil {
-			log.Printf("error copying from dst -> src: %v\n", err)
-		}
-		// Signal peer that no more data is coming.
-		err = src.CloseWrite()
-		if err != nil {
-			log.Printf("error calling CloseWrite on src %v\n", err)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(dst, io.TeeReader(src, newHexDumper("[CLIENT→SERVER] ")))
-		if err != nil {
-			log.Printf("error copying from src -> dst: %v\n", err)
-		}
-		// Signal peer that no more data is coming.
-		err = dst.CloseWrite()
-		if err != nil {
-			log.Printf("error calling CloseWrite on dst %v\n", err)
-		}
-	}()
-
-	wg.Wait()
-	log.Printf("Connection finished [source: %s destination: %s]\n", src.RemoteAddr(), dst.RemoteAddr())
-}
-
-type hexDumper struct {
-	prefix string
-}
-
-func newHexDumper(prefix string) *hexDumper {
-	return &hexDumper{prefix: prefix}
-}
-
-func (h *hexDumper) Write(data []byte) (int, error) {
-	if len(data) == 0 {
-		return 0, nil
+	// Log response body
+	if w.body.Len() > 0 {
+		printGreen("\nBody:\n%s\n", w.body.String())
 	}
+}
 
-	fmt.Printf("%s%s\n", h.prefix, hex.Dump(data))
-	return len(data), nil
+func generateRandomFilename(prefix string) (string, error) {
+	bytes := make([]byte, 8)
+	_, err := rand.Read(bytes)
+	if err != nil {
+		return "", err
+	}
+	filename := fmt.Sprintf("%s_%x.txt", prefix, bytes)
+	return filepath.Join(os.TempDir(), filename), nil
 }
