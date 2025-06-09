@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -43,11 +45,6 @@ func main() {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
-
-			// Check if this is a messages API request
-			if r.In.URL.Path == "/v1/messages" && r.In.Method == "POST" {
-				inspectAnthropicRequest(r)
-			}
 		},
 	}
 
@@ -55,11 +52,23 @@ func main() {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logRequest(r)
 
+		// Check if this is an Anthropic API request that needs special handling
+		if r.Method == "POST" {
+			switch r.URL.Path {
+			case "/v1/messages":
+				if handleMessage(r, w) {
+					return // Response already written
+				}
+			case "/v1/messages/count_tokens":
+				if handleTokenCount(r, w) {
+					return // Response already written
+				}
+			}
+		}
+
 		// Capture response
 		responseWriter := &responseLogger{ResponseWriter: w}
-
 		proxy.ServeHTTP(responseWriter, r)
-
 		logResponse(responseWriter)
 	})
 
@@ -107,7 +116,7 @@ func logRequest(r *http.Request) {
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	// printBlue("\nBody:\n%s\n", string(bodyBytes))
+	printBlue("\nBody:\n%s\n", string(bodyBytes))
 
 	// Write request body to file
 	filename, err := generateRandomFilename("request")
@@ -127,7 +136,7 @@ func logResponse(w *responseLogger) {
 	printGreen("=== RESPONSE ===\n")
 	printGreen("Status: %d %s\n", w.statusCode, http.StatusText(w.statusCode))
 
-	return
+	// return
 	// Log response headers
 	for name, values := range w.Header() {
 		for _, value := range values {
@@ -137,7 +146,7 @@ func logResponse(w *responseLogger) {
 
 	// Log response body
 	if w.body.Len() > 0 {
-		// printGreen("\nBody:\n%s\n", w.body.String())
+		printGreen("\nBody:\n%s\n", w.body.String())
 	}
 }
 
@@ -176,11 +185,41 @@ func inspectAnthropicRequest(r *httputil.ProxyRequest) {
 	printYellow("Successfully parsed Anthropic request:\n")
 	printYellow("  Model: %s\n", params.Model)
 	printYellow("  Max Tokens: %d\n", params.MaxTokens)
-	// if len(params.Messages) > 0 {
 	printYellow("  Messages count: %d\n", len(params.Messages))
-	// printYellow("  First message role: %s\n", params.Messages[0].Role)
-	// }
-	// if params.Tools != nil && len(params.Tools) > 0 {
 	printYellow("  Tools count: %d\n", len(params.Tools))
-	// }
+}
+
+func handleMessage(r *http.Request, w http.ResponseWriter) bool {
+	// Read the request body
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		printRed("Error reading request body: %v\n", err)
+		return false
+	}
+
+	// Restore the body for potential forwarding
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	// Parse into MessageNewParams
+	var params anthropic.MessageNewParams
+	err = params.UnmarshalJSON(bodyBytes)
+	if err != nil {
+		printRed("Error parsing MessageNewParams: %v\n", err)
+		return false
+	}
+
+	// Check if we should suppress Haiku generation
+	if suppressHaikuGeneration(&params, w) {
+		return true
+	}
+
+	// Additional message handling logic can go here
+
+	return false
+}
+
+
+func handleTokenCount(r *http.Request, w http.ResponseWriter) bool {
+	// TODO: Implement token count handling
+	return false
 }
