@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -13,7 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
+	"strconv"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -69,7 +68,7 @@ func main() {
 		// Capture response
 		responseWriter := &responseLogger{ResponseWriter: w}
 		proxy.ServeHTTP(responseWriter, r)
-		logResponse(responseWriter)
+		logResponse(responseWriter, r)
 	})
 
 	listenAddress := *listenAddr + ":" + *listenPort
@@ -132,11 +131,19 @@ func logRequest(r *http.Request) {
 	printYellow("Request body saved to: %s\n", filename)
 }
 
-func logResponse(w *responseLogger) {
+func logResponse(w *responseLogger, r *http.Request) {
 	printGreen("=== RESPONSE ===\n")
 	printGreen("Status: %d %s\n", w.statusCode, http.StatusText(w.statusCode))
 
-	// return
+	// Check if this is a token count response that needs caching
+	if hash, ok := getCacheHashFromContext(r.Context()); ok {
+		if w.statusCode == http.StatusOK && w.body.Len() > 0 {
+			globalTokenCache.set(hash, w.body.Bytes())
+			printYellow("Cached token count response with hash: %s\n", hash[:8]+"...")
+		}
+	}
+
+	return
 	// Log response headers
 	for name, values := range w.Header() {
 		for _, value := range values {
@@ -220,6 +227,33 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 
 
 func handleTokenCount(r *http.Request, w http.ResponseWriter) bool {
-	// TODO: Implement token count handling
+	// Read the request body
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		printRed("Error reading token count request body: %v\n", err)
+		return false
+	}
+
+	// Restore the body for potential forwarding
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	// Generate hash for cache key
+	hash := hashRequestBody(bodyBytes)
+
+	// Check if we have a cached response
+	if cachedResponse, exists := globalTokenCache.get(hash); exists {
+		printGreen("Token count cache hit! Returning cached response\n")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(cachedResponse)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(cachedResponse)
+		return true
+	}
+
+	// Cache miss - add hash to context for response caching
+	printYellow("Token count cache miss. Request will be forwarded and response cached\n")
+	ctx := addCacheHashToContext(r.Context(), hash)
+	*r = *r.WithContext(ctx)
+
 	return false
 }
