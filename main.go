@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+
+	"github.com/anthropics/anthropic-sdk-go"
 )
 
 // todo:
@@ -41,6 +43,11 @@ func main() {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
+
+			// Check if this is a messages API request
+			if r.In.URL.Path == "/v1/messages" && r.In.Method == "POST" {
+				inspectAnthropicRequest(r)
+			}
 		},
 	}
 
@@ -81,12 +88,12 @@ func (r *responseLogger) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
-
 func logRequest(r *http.Request) {
 	printBlue("=== REQUEST ===\n")
 	printBlue("%s %s %s\n", r.Method, r.RequestURI, r.Proto)
 	printBlue("Host: %s\n", r.Host)
 
+	return
 	// Log headers
 	for name, values := range r.Header {
 		for _, value := range values {
@@ -120,6 +127,7 @@ func logResponse(w *responseLogger) {
 	printGreen("=== RESPONSE ===\n")
 	printGreen("Status: %d %s\n", w.statusCode, http.StatusText(w.statusCode))
 
+	return
 	// Log response headers
 	for name, values := range w.Header() {
 		for _, value := range values {
@@ -129,7 +137,7 @@ func logResponse(w *responseLogger) {
 
 	// Log response body
 	if w.body.Len() > 0 {
-		printGreen("\nBody:\n%s\n", w.body.String())
+		// printGreen("\nBody:\n%s\n", w.body.String())
 	}
 }
 
@@ -141,4 +149,38 @@ func generateRandomFilename(prefix string) (string, error) {
 	}
 	filename := fmt.Sprintf("%s_%x.txt", prefix, bytes)
 	return filepath.Join(os.TempDir(), filename), nil
+}
+
+func inspectAnthropicRequest(r *httputil.ProxyRequest) {
+	printYellow("Detected Anthropic /v1/messages request\n")
+
+	// Read the request body
+	bodyBytes, err := io.ReadAll(r.In.Body)
+	if err != nil {
+		printRed("Error reading request body: %v\n", err)
+		return
+	}
+
+	// Restore the body for forwarding
+	r.Out.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	// Parse into MessageNewParams
+	var params anthropic.MessageNewParams
+	err = params.UnmarshalJSON(bodyBytes)
+	if err != nil {
+		printRed("Error parsing MessageNewParams: %v\n", err)
+		return
+	}
+
+	// Log basic information about the parsed request
+	printYellow("Successfully parsed Anthropic request:\n")
+	printYellow("  Model: %s\n", params.Model)
+	printYellow("  Max Tokens: %d\n", params.MaxTokens)
+	// if len(params.Messages) > 0 {
+	printYellow("  Messages count: %d\n", len(params.Messages))
+	// printYellow("  First message role: %s\n", params.Messages[0].Role)
+	// }
+	// if params.Tools != nil && len(params.Tools) > 0 {
+	printYellow("  Tools count: %d\n", len(params.Tools))
+	// }
 }
