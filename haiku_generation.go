@@ -10,7 +10,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
-func suppressHaikuGeneration(params *anthropic.MessageNewParams, w http.ResponseWriter) bool {
+func suppressHaikuGeneration(params *anthropic.BetaMessageNewParams, w http.ResponseWriter) bool {
 	// Check conditions for suppression
 	if params.Model != anthropic.ModelClaude3_5Haiku20241022 {
 		return false
@@ -26,7 +26,7 @@ func suppressHaikuGeneration(params *anthropic.MessageNewParams, w http.Response
 		return false
 	}
 
-	printYellow("Suppressing request - conditions met!\n")
+	printYellow("Suppressing Haiku generation!\n")
 	sendStreamingResponse(w)
 	return true
 }

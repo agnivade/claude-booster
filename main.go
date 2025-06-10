@@ -18,13 +18,17 @@ import (
 )
 
 // todo:
-// parse the request into struct
-// disable haiku generation.
-// cache count_tokens response.
+// parse the request into struct --
+// disable haiku generation. --
+// cache count_tokens response. --
+// strip unnecessary tools from prompts. --
 // strip unnecessary words from prompts like - IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context or otherwise consider it in your response unless it is highly relevant to your task. Most of the time, it is not relevant.\n</system-reminder>\n
-// strip unnecessary tools from prompts.
 // re-arrange prompts to have tools earlier for better caching.
 // add Prometheus metrics
+// - change temperature
+// - compress tokens
+// - RAG
+// - claude usage statistics.
 
 func main() {
 	targetURL := flag.String("target", "", "Target URL to proxy to (required)")
@@ -97,9 +101,7 @@ func (r *responseLogger) Write(body []byte) (int, error) {
 }
 
 func logRequest(r *http.Request) {
-	printBlue("=== REQUEST ===\n")
-	printBlue("%s %s %s\n", r.Method, r.RequestURI, r.Proto)
-	printBlue("Host: %s\n", r.Host)
+	printBlue("→ %s %s %s\n", r.Method, r.RequestURI, r.Proto)
 
 	return
 	// Log headers
@@ -115,10 +117,14 @@ func logRequest(r *http.Request) {
 		return
 	}
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	printBlue("\nBody:\n%s\n", string(bodyBytes))
+	// printBlue("\nBody:\n%s\n", string(bodyBytes))
 
 	// Write request body to file
-	filename, err := generateRandomFilename("request")
+	writeToFile(bodyBytes, "claude_june10")
+}
+
+func writeToFile(bodyBytes []byte, prefix string) {
+	filename, err := generateRandomFilename(prefix)
 	if err != nil {
 		printRed("Error generating filename: %v\n", err)
 		return
@@ -132,8 +138,11 @@ func logRequest(r *http.Request) {
 }
 
 func logResponse(w *responseLogger, r *http.Request) {
-	printGreen("=== RESPONSE ===\n")
-	printGreen("Status: %d %s\n", w.statusCode, http.StatusText(w.statusCode))
+	if w.statusCode == http.StatusOK {
+		printGreen("← %d %s\n", w.statusCode, http.StatusText(w.statusCode))
+	} else {
+		printRed("← %d %s\n", w.statusCode, http.StatusText(w.statusCode))
+	}
 
 	// Check if this is a token count response that needs caching
 	if hash, ok := getCacheHashFromContext(r.Context()); ok {
@@ -167,35 +176,6 @@ func generateRandomFilename(prefix string) (string, error) {
 	return filepath.Join(os.TempDir(), filename), nil
 }
 
-func inspectAnthropicRequest(r *httputil.ProxyRequest) {
-	printYellow("Detected Anthropic /v1/messages request\n")
-
-	// Read the request body
-	bodyBytes, err := io.ReadAll(r.In.Body)
-	if err != nil {
-		printRed("Error reading request body: %v\n", err)
-		return
-	}
-
-	// Restore the body for forwarding
-	r.Out.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-	// Parse into MessageNewParams
-	var params anthropic.MessageNewParams
-	err = params.UnmarshalJSON(bodyBytes)
-	if err != nil {
-		printRed("Error parsing MessageNewParams: %v\n", err)
-		return
-	}
-
-	// Log basic information about the parsed request
-	printYellow("Successfully parsed Anthropic request:\n")
-	printYellow("  Model: %s\n", params.Model)
-	printYellow("  Max Tokens: %d\n", params.MaxTokens)
-	printYellow("  Messages count: %d\n", len(params.Messages))
-	printYellow("  Tools count: %d\n", len(params.Tools))
-}
-
 func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 	// Read the request body
 	bodyBytes, err := io.ReadAll(r.Body)
@@ -204,11 +184,8 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 		return false
 	}
 
-	// Restore the body for potential forwarding
-	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
 	// Parse into MessageNewParams
-	var params anthropic.MessageNewParams
+	var params anthropic.BetaMessageNewParams
 	err = params.UnmarshalJSON(bodyBytes)
 	if err != nil {
 		printRed("Error parsing MessageNewParams: %v\n", err)
@@ -220,11 +197,77 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 		return true
 	}
 
+	// Log basic information about the parsed request
+	// printYellow("Successfully parsed Anthropic request:\n")
+	// printYellow("  Model: %s\n", params.Model)
+	// printYellow("  Max Tokens: %d\n", params.MaxTokens)
+	// printYellow("  Messages count: %d\n", len(params.Messages))
+	// printYellow("  Tools count: %d\n", len(params.Tools))
+
+	// Process tools and update request if needed
+	bodyModified := filterTools(&params, r)
+
+	// If tools weren't filtered, restore original body
+	if !bodyModified {
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
 	// Additional message handling logic can go here
 
 	return false
 }
 
+func filterTools(params *anthropic.BetaMessageNewParams, r *http.Request) bool {
+	if params.Model != anthropic.ModelClaudeSonnet4_20250514 || len(params.Tools) == 0 {
+		return false
+	}
+
+	// printBlue("Tools in request:\n")
+	// for i, tool := range params.Tools {
+	// 	printBlue("  [%d] %s\n", i, *tool.GetName())
+	// }
+
+	// Filter out NotebookRead and NotebookEdit tools
+	originalLen := len(params.Tools)
+	filtered := params.Tools[:0]
+	for _, tool := range params.Tools {
+		name := *tool.GetName()
+		if name != "NotebookRead" && name != "NotebookEdit" {
+			filtered = append(filtered, tool)
+		}
+	}
+
+	// var filteredTools []anthropic.ToolUnionParam
+	// for _, tool := range params.Tools {
+	// 	if name != "NotebookRead" && name != "NotebookEdit" {
+	// 		filteredTools = append(filteredTools, tool)
+	// 	}
+	// }
+	// return false
+	// If tools were filtered, update the request body
+	if len(filtered) != originalLen {
+		printYellow("Filtered out %d/%d tools. Remaining: %d\n", len(params.Tools)-len(filtered), len(params.Tools))
+		params.Tools = filtered
+
+		// Marshal the modified params back to JSON
+		// TODO: change to json.Marshal
+		modifiedBody, err := params.MarshalJSON()
+		if err != nil {
+			printRed("Error marshaling modified request: %v\n", err)
+			return false
+		}
+		// printBlue("\nBody:\n%s\n", string(modifiedBody))
+		// writeToFile(modifiedBody, "tools_debug")
+
+		// Replace the request body
+		r.Body = io.NopCloser(bytes.NewReader(modifiedBody))
+		r.ContentLength = int64(len(modifiedBody))
+		r.Header.Set("Content-Length", strconv.Itoa(len(modifiedBody)))
+		return true
+	}
+
+	return false
+}
 
 func handleTokenCount(r *http.Request, w http.ResponseWriter) bool {
 	// Read the request body
