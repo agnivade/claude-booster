@@ -60,10 +60,10 @@ func sendStreamingResponse(w http.ResponseWriter) {
 			"stop_reason":   nil,
 			"stop_sequence": nil,
 			"usage": map[string]any{
-				"input_tokens":                207,
+				"input_tokens":                0,
 				"cache_creation_input_tokens": 0,
 				"cache_read_input_tokens":     0,
-				"output_tokens":               2,
+				"output_tokens":               0,
 				"service_tier":                "standard",
 			},
 		},
@@ -118,7 +118,7 @@ func sendStreamingResponse(w http.ResponseWriter) {
 			"stop_sequence": nil,
 		},
 		"usage": map[string]any{
-			"output_tokens": 5,
+			"output_tokens": 0,
 		},
 	}
 	sendSSEEvent(w, "message_delta", messageDelta)
