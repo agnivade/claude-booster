@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -19,13 +21,11 @@ import (
 // disable haiku generation. --
 // cache count_tokens response. --
 // strip unnecessary tools from prompts. --
-// strip unnecessary words from prompts like - IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context or otherwise consider it in your response unless it is highly relevant to your task. Most of the time, it is not relevant.\n</system-reminder>\n
+// change temperature --
+// add Prometheus metrics --
+// strip unnecessary words from prompts like - IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context or otherwise consider it in your response unless it is highly relevant to your task. Most of the time, it is not relevant.\n</system-reminder>\n --
 // re-arrange prompts to have tools earlier for better caching.
-// add Prometheus metrics
-// - change temperature
-// - compress tokens
 // - RAG
-// - claude usage statistics.
 
 func main() {
 	targetURL := flag.String("target", "", "Target URL to proxy to (required)")
@@ -118,23 +118,19 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 		return true
 	}
 
-	var bodyModified bool
 	if params.Model == anthropic.ModelClaudeSonnet4_20250514 {
 		// Log basic information about the parsed request
-		printYellow("Successfully parsed Anthropic request:\n")
-		printYellow("  Max Tokens: %d\n", params.MaxTokens)
-		printYellow("  Messages count: %d\n", len(params.Messages))
+		// printYellow("Successfully parsed Anthropic request:\n")
+		// printYellow("  Max Tokens: %d\n", params.MaxTokens)
+		// printYellow("  Messages count: %d\n", len(params.Messages))
 		// printYellow("  Tools count: %d\n", len(params.Tools))
-		printYellow("  Temperature: %f\n", params.Temperature.Value)
-		// printYellow("  Thinking: %v, %v\n", params.Thinking.GetBudgetTokens(), params.Thinking.GetType())
-
-		// Set temperature
-		params.Temperature = anthropic.Float(0.1)
-		bodyModified = true
 	}
 
-	// Process tools and update request if needed
-	bodyModified = bodyModified || filterTools(&params)
+	// Process modifications
+	bodyModified := setTemperature(&params)
+	bodyModified = setUserPrompt(&params) || bodyModified
+	bodyModified = setSystemPrompt(&params) || bodyModified
+	bodyModified = filterTools(&params) || bodyModified
 
 	// Additional message handling logic can go here
 
@@ -146,7 +142,7 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 			return false
 		}
 
-		writeToFile(modifiedBody, "june_10_temperature")
+		// writeToFile(modifiedBody, "june11")
 
 		r.Body = io.NopCloser(bytes.NewReader(modifiedBody))
 		r.ContentLength = int64(len(modifiedBody))
@@ -156,6 +152,70 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
+	return false
+}
+
+func setTemperature(params *anthropic.BetaMessageNewParams) bool {
+	if params.Model != anthropic.ModelClaudeSonnet4_20250514 {
+		return false
+	}
+
+	params.Temperature = anthropic.Float(0.1)
+	return true
+}
+
+func setUserPrompt(params *anthropic.BetaMessageNewParams) bool {
+	if params.Model != anthropic.ModelClaudeSonnet4_20250514 {
+		return false
+	}
+
+	if len(params.Messages[0].Content) > 0 {
+		if ptr := params.Messages[0].Content[0].GetText(); ptr != nil {
+			txt := *ptr
+
+			if strings.HasPrefix(txt, "<system-reminder>") {
+				// Read replacement text from file
+				replacementText, err := os.ReadFile("assets/user_prompt.txt")
+				if err != nil {
+					printRed("Error reading user_prompt.txt: %v\n", err)
+					return false
+				}
+				*ptr = string(replacementText)
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func setSystemPrompt(params *anthropic.BetaMessageNewParams) bool {
+	if params.Model != anthropic.ModelClaudeSonnet4_20250514 {
+		return false
+	}
+
+	if len(params.System) > 0 {
+		// Read system prompt from file
+		systemPromptText, err := os.ReadFile("assets/system_prompt.txt")
+		if err != nil {
+			printRed("Error reading system_prompt.txt: %v\n", err)
+			return false
+		}
+
+		// Replace system prompt.
+		params.System = []anthropic.BetaTextBlockParam{
+			{
+				// This must be there. Otherwise, it rejects the request.
+				Text:         "You are Claude Code, Anthropic's official CLI for Claude.",
+				CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
+			},
+			{
+				Text:         string(systemPromptText),
+				CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
+			},
+		}
+		return true
+	}
 
 	return false
 }
@@ -163,6 +223,36 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 func filterTools(params *anthropic.BetaMessageNewParams) bool {
 	if params.Model != anthropic.ModelClaudeSonnet4_20250514 || len(params.Tools) == 0 {
 		return false
+	}
+
+	var toolsModified bool
+	// Replace long tool descriptions with shorter ones
+	for _, tool := range params.Tools {
+		name := *tool.GetName()
+		if desc := tool.GetDescription(); desc != nil && len(*desc) > 5000 {
+			printYellow("Tool '%s' has long description (%d chars), replacing...\n", name, len(*desc))
+
+			var filename string
+			switch name {
+			case "Bash":
+				filename = "assets/tool_bash_description.txt"
+			case "TodoWrite":
+				filename = "assets/tool_todowrite_description.txt"
+			default:
+				continue
+			}
+
+			newDesc, err := os.ReadFile(filename)
+			if err != nil {
+				printRed("Error reading %s: %v\n", filename, err)
+				continue
+			}
+
+			// GetDescription != nil, means OfTool is not nil
+			tool.OfTool.Description = anthropic.String(string(newDesc))
+
+			toolsModified = true
+		}
 	}
 
 	// Filter out NotebookRead and NotebookEdit tools
@@ -179,10 +269,10 @@ func filterTools(params *anthropic.BetaMessageNewParams) bool {
 	if len(filtered) != originalLen {
 		printYellow("Filtered out %d/%d tools.\n", originalLen-len(filtered), originalLen)
 		params.Tools = filtered
-		return true
+		toolsModified = true
 	}
 
-	return false
+	return toolsModified
 }
 
 func handleTokenCount(r *http.Request, w http.ResponseWriter) bool {
