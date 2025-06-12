@@ -131,8 +131,8 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 	bodyModified = setUserPrompt(&params) || bodyModified
 	bodyModified = setSystemPrompt(&params) || bodyModified
 	bodyModified = filterTools(&params) || bodyModified
-
-	// Additional message handling logic can go here
+	// This should be the last.
+	bodyModified = alterCacheControl(&params) || bodyModified
 
 	// Marshal and set body if any modifications were made
 	if bodyModified {
@@ -142,7 +142,7 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 			return false
 		}
 
-		// writeToFile(modifiedBody, "june11")
+		// writeToFile(modifiedBody, "june11_final")
 
 		r.Body = io.NopCloser(bytes.NewReader(modifiedBody))
 		r.ContentLength = int64(len(modifiedBody))
@@ -207,13 +207,61 @@ func setSystemPrompt(params *anthropic.BetaMessageNewParams) bool {
 			{
 				// This must be there. Otherwise, it rejects the request.
 				Text:         "You are Claude Code, Anthropic's official CLI for Claude.",
-				CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
+				// CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
 			},
 			{
 				Text:         string(systemPromptText),
 				CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
 			},
 		}
+		return true
+	}
+
+	return false
+}
+
+func alterCacheControl(params *anthropic.BetaMessageNewParams) bool {
+	if params.Model != anthropic.ModelClaudeSonnet4_20250514 || len(params.Tools) == 0 {
+		return false
+	}
+
+	// Set cache control on the last tool to ephemeral
+	lastIndex := len(params.Tools) - 1
+	lastTool := params.Tools[lastIndex]
+
+	cacheControl := anthropic.NewBetaCacheControlEphemeralParam()
+
+	// Check all possible tool types and set cache control
+	// TODO: need to find a better way to achieve this.
+	if lastTool.OfTool != nil {
+		lastTool.OfTool.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfComputerUseTool20241022 != nil {
+		lastTool.OfComputerUseTool20241022.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfBashTool20241022 != nil {
+		lastTool.OfBashTool20241022.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfTextEditor20241022 != nil {
+		lastTool.OfTextEditor20241022.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfComputerUseTool20250124 != nil {
+		lastTool.OfComputerUseTool20250124.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfBashTool20250124 != nil {
+		lastTool.OfBashTool20250124.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfTextEditor20250124 != nil {
+		lastTool.OfTextEditor20250124.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfTextEditor20250429 != nil {
+		lastTool.OfTextEditor20250429.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfWebSearchTool20250305 != nil {
+		lastTool.OfWebSearchTool20250305.CacheControl = cacheControl
+		return true
+	} else if lastTool.OfCodeExecutionTool20250522 != nil {
+		lastTool.OfCodeExecutionTool20250522.CacheControl = cacheControl
 		return true
 	}
 
