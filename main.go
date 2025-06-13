@@ -10,31 +10,46 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
 
-// todo:
-// parse the request into struct --
-// disable haiku generation. --
-// cache count_tokens response. --
-// strip unnecessary tools from prompts. --
-// change temperature --
-// add Prometheus metrics --
-// strip unnecessary words from prompts like - IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context or otherwise consider it in your response unless it is highly relevant to your task. Most of the time, it is not relevant.\n</system-reminder>\n --
-// re-arrange prompts to have tools earlier for better caching.
-// - RAG
+type Config struct {
+	SuppressHaiku bool
+	Temperature   float64
+	RootDir       string
+}
+
+type TemplateData struct {
+	UserPrivate    string
+	ProjectPrivate string
+	ProjectPublic  string
+}
 
 func main() {
 	targetURL := flag.String("target", "", "Target URL to proxy to (required)")
 	listenAddr := flag.String("addr", "localhost", "Listen address")
 	listenPort := flag.String("port", "8080", "Listen port")
+	suppressHaiku := flag.Bool("suppress-haiku", false, "Enable haiku generation suppression")
+	temperature := flag.Float64("temperature", 0.1, "Temperature for Claude Sonnet 4 requests")
+	rootDir := flag.String("root-dir", "", "Root directory for project files (required)")
 	flag.Parse()
+
+	config := Config{
+		SuppressHaiku: *suppressHaiku,
+		Temperature:   *temperature,
+		RootDir:       *rootDir,
+	}
 
 	if *targetURL == "" {
 		log.Fatal("Target URL is required. Use -target flag.")
+	}
+	if *rootDir == "" {
+		log.Fatal("Root directory is required. Use -root-dir flag.")
 	}
 
 	target, err := url.Parse(*targetURL)
@@ -56,7 +71,7 @@ func main() {
 		if r.Method == "POST" {
 			switch r.URL.Path {
 			case "/v1/messages":
-				if handleMessage(r, w) {
+				if handleMessage(r, w, config) {
 					return // Response already written
 				}
 			case "/v1/messages/count_tokens":
@@ -97,7 +112,7 @@ func (r *responseLogger) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
-func handleMessage(r *http.Request, w http.ResponseWriter) bool {
+func handleMessage(r *http.Request, w http.ResponseWriter, config Config) bool {
 	// Read the request body
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -114,7 +129,7 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 	}
 
 	// Check if we should suppress Haiku generation
-	if suppressHaikuGeneration(&params, w) {
+	if config.SuppressHaiku && suppressHaikuGeneration(&params, w) {
 		return true
 	}
 
@@ -127,8 +142,8 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 	}
 
 	// Process modifications
-	bodyModified := setTemperature(&params)
-	bodyModified = setUserPrompt(&params) || bodyModified
+	bodyModified := setTemperature(&params, config)
+	bodyModified = setUserPrompt(&params, config) || bodyModified
 	bodyModified = setSystemPrompt(&params) || bodyModified
 	bodyModified = filterTools(&params) || bodyModified
 	// This should be the last.
@@ -142,7 +157,7 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 			return false
 		}
 
-		// writeToFile(modifiedBody, "june11_final")
+		// writeToFile(modifiedBody, "june13")
 
 		r.Body = io.NopCloser(bytes.NewReader(modifiedBody))
 		r.ContentLength = int64(len(modifiedBody))
@@ -155,16 +170,21 @@ func handleMessage(r *http.Request, w http.ResponseWriter) bool {
 	return false
 }
 
-func setTemperature(params *anthropic.BetaMessageNewParams) bool {
+func setTemperature(params *anthropic.BetaMessageNewParams, config Config) bool {
 	if params.Model != anthropic.ModelClaudeSonnet4_20250514 {
 		return false
 	}
 
-	params.Temperature = anthropic.Float(0.1)
+	// We can't override temperature when thinking is enabled.
+	if thinking := params.Thinking.OfEnabled; thinking != nil && thinking.Type == "enabled" {
+		return false
+	}
+
+	params.Temperature = anthropic.Float(config.Temperature)
 	return true
 }
 
-func setUserPrompt(params *anthropic.BetaMessageNewParams) bool {
+func setUserPrompt(params *anthropic.BetaMessageNewParams, config Config) bool {
 	if params.Model != anthropic.ModelClaudeSonnet4_20250514 {
 		return false
 	}
@@ -174,13 +194,16 @@ func setUserPrompt(params *anthropic.BetaMessageNewParams) bool {
 			txt := *ptr
 
 			if strings.HasPrefix(txt, "<system-reminder>") {
-				// Read replacement text from file
-				replacementText, err := os.ReadFile("assets/user_prompt.txt")
+				// Load template data
+				templateData := loadTemplateData(config.RootDir)
+
+				// Process template
+				processedText, err := processTemplate("assets/user_prompt.txt", templateData)
 				if err != nil {
-					printRed("Error reading user_prompt.txt: %v\n", err)
+					printRed("Error processing user_prompt.txt template: %v\n", err)
 					return false
 				}
-				*ptr = string(replacementText)
+				*ptr = processedText
 				return true
 			}
 		}
@@ -206,7 +229,7 @@ func setSystemPrompt(params *anthropic.BetaMessageNewParams) bool {
 		params.System = []anthropic.BetaTextBlockParam{
 			{
 				// This must be there. Otherwise, it rejects the request.
-				Text:         "You are Claude Code, Anthropic's official CLI for Claude.",
+				Text: "You are Claude Code, Anthropic's official CLI for Claude.",
 				// CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
 			},
 			{
@@ -353,4 +376,61 @@ func handleTokenCount(r *http.Request, w http.ResponseWriter) bool {
 	*r = *r.WithContext(ctx)
 
 	return false
+}
+
+func loadFileContent(filePath string) string {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			// Other errors (permissions, etc.) should be logged
+			printYellow("Warning: Could not read file %s: %v\n", filePath, err)
+		}
+		return ""
+	}
+	return string(content)
+}
+
+func loadUserPrivate() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		printYellow("Warning: Could not get user home directory: %v\n", err)
+		return ""
+	}
+	return loadFileContent(filepath.Join(homeDir, ".claude", "CLAUDE.md"))
+}
+
+func loadProjectPrivate(rootDir string) string {
+	return loadFileContent(filepath.Join(rootDir, "CLAUDE.local.md"))
+}
+
+func loadProjectPublic(rootDir string) string {
+	return loadFileContent(filepath.Join(rootDir, "CLAUDE.md"))
+}
+
+func loadTemplateData(rootDir string) TemplateData {
+	return TemplateData{
+		UserPrivate:    loadUserPrivate(),
+		ProjectPrivate: loadProjectPrivate(rootDir),
+		ProjectPublic:  loadProjectPublic(rootDir),
+	}
+}
+
+func processTemplate(templatePath string, data TemplateData) (string, error) {
+	templateContent, err := os.ReadFile(templatePath)
+	if err != nil {
+		return "", err
+	}
+
+	tmpl, err := template.New("userPrompt").Parse(string(templateContent))
+	if err != nil {
+		return "", err
+	}
+
+	var buf bytes.Buffer
+	err = tmpl.Execute(&buf, data)
+	if err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
 }
