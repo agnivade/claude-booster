@@ -1,6 +1,6 @@
 # Claude Booster
 
-A sophisticated HTTP reverse proxy for Anthropic's Claude API with advanced request manipulation, caching, and templating capabilities.
+A faster, cheaper and more tunable Claude Code.
 
 ## Features
 
