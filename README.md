@@ -26,7 +26,7 @@ go build -o claude-booster .
 ./claude-booster -target https://api.anthropic.com -root-dir /path/to/your/project
 ```
 
-And then type `HTTP_PROXY=http://localhost:8080 claude`
+And then type `ANTHROPIC_BASE_URL=http://localhost:8080 claude`
 
 ### Command Line Flags
 
